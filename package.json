@@ -1,0 +1,30 @@
+{
+  "name": "azure-api-proxy",
+  "version": "1.0.0",
+  "description": "Azure API Proxy Server",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
+  },
+  "keywords": [
+    "azure",
+    "api",
+    "proxy"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "axios": "^1.6.2",
+    "node-rsa": "^1.1.1",
+    "sqlite3": "^5.1.6",
+    "sqlite": "^5.1.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
