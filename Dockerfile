@@ -5,22 +5,24 @@ FROM node:18-alpine
 WORKDIR /app
 
 # 安装 sqlite3 编译所需的依赖
-RUN apk add --no-cache python3 make g++
+RUN apk add --no-cache python3 make g++ sqlite
 
-# 复制 package.json 和 package-lock.json（如果存在）
-COPY package*.json ./
+# 复制 package.json
+COPY package.json ./
 
-# 安装依赖
-RUN npm ci --only=production
+# 安装依赖（使用 npm install 而不是 npm ci）
+RUN npm install --production
 
 # 清理编译依赖以减小镜像大小
-RUN apk del python3 make g++
+RUN apk del python3 make g++ && \
+    rm -rf /root/.npm /root/.node-gyp
 
 # 复制应用程序代码
-COPY app.js .
+COPY app.js ./
 
 # 创建数据目录
-RUN mkdir -p /app/data
+RUN mkdir -p /app/data && \
+    chmod 755 /app/data
 
 # 设置环境变量默认值
 ENV NODE_ENV=production \
@@ -33,6 +35,14 @@ ENV NODE_ENV=production \
     KEY_EXPIRY_MINUTES=60 \
     MODEL_CACHE_DAYS=7 \
     USE_SQLITE=true
+
+# 创建非 root 用户运行应用
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001 && \
+    chown -R nodejs:nodejs /app
+
+# 切换到非 root 用户
+USER nodejs
 
 # 暴露端口
 EXPOSE 3000
