@@ -4,6 +4,7 @@ const NodeRSA = require('node-rsa');
 const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
 const crypto = require('crypto');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
 app.use(express.json());
@@ -120,8 +121,13 @@ class AzureKeyManager {
         const needed = MAX_KEYS - keys.length;
         
         if (needed > 0) {
+            console.log(`Generating ${needed} new Azure keys...`);
             for (let i = 0; i < needed; i++) {
-                await this.generateNewKey();
+                try {
+                    await this.generateNewKey();
+                } catch (error) {
+                    console.error('Failed to generate key:', error.message);
+                }
             }
         }
         
@@ -139,7 +145,8 @@ class AzureKeyManager {
             const response = await axios.post(`${BASE_URL}/backend-api/v2/public-key`, {}, {
                 headers: {
                     'User-Agent': userAgent
-                }
+                },
+                timeout: 10000
             });
 
             const { data, public_key, user } = response.data;
@@ -261,6 +268,12 @@ function processMediaLinks(content) {
         return `src="${processFileUrl(url)}"`;
     });
     
+    // 处理 thumbnail 链接
+    content = content.replace(/src="\/thumbnail\/([^"]+)"/g, (match, path) => {
+        const url = `${BASE_URL}/thumbnail/${path}`;
+        return `src="${processFileUrl(url)}"`;
+    });
+    
     return content;
 }
 
@@ -280,7 +293,8 @@ app.get('/v1/models', authenticate, async (req, res) => {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${key}`,
                     'User-Agent': userAgent
-                }
+                },
+                timeout: 30000
             });
             
             models = response.data.data;
@@ -322,7 +336,8 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${key}`,
                     'User-Agent': userAgent
-                }
+                },
+                timeout: 30000
             });
             models = response.data.data;
             await setModelsCache(models);
@@ -358,7 +373,8 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
                         'Content-Type': 'application/json',
                         'Authorization': `Bearer ${key}`,
                         'User-Agent': userAgent
-                    }
+                    },
+                    timeout: 60000
                 }
             );
             
@@ -368,18 +384,20 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
             // 格式化响应内容
             const content = `## 图片已生成成功\n### 提示词如下：${prompt}\n### 绘图模型：${model}\n### 绘图结果如下：\n![${prompt}](${imageUrl})`;
             
+            const messageId = `chatcmpl-${crypto.randomBytes(16).toString('hex')}`;
+            const timestamp = Math.floor(Date.now() / 1000);
+            
             if (stream) {
                 // 流式响应
                 res.setHeader('Content-Type', 'text/event-stream');
                 res.setHeader('Cache-Control', 'no-cache');
                 res.setHeader('Connection', 'keep-alive');
                 
-                const messageId = `chatcmpl-${crypto.randomBytes(16).toString('hex')}`;
-                
+                // 发送开始块
                 res.write(`data: ${JSON.stringify({
                     id: messageId,
                     object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
+                    created: timestamp,
                     model: model,
                     choices: [{
                         index: 0,
@@ -388,16 +406,22 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
                     }]
                 })}\n\n`);
                 
+                // 发送结束块
                 res.write(`data: ${JSON.stringify({
                     id: messageId,
                     object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
+                    created: timestamp,
                     model: model,
                     choices: [{
                         index: 0,
                         delta: { content: '' },
                         finish_reason: 'stop'
-                    }]
+                    }],
+                    usage: {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0
+                    }
                 })}\n\n`);
                 
                 res.write('data: [DONE]\n\n');
@@ -405,9 +429,9 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
             } else {
                 // 非流式响应
                 res.json({
-                    id: `chatcmpl-${crypto.randomBytes(16).toString('hex')}`,
+                    id: messageId,
                     object: 'chat.completion',
-                    created: Math.floor(Date.now() / 1000),
+                    created: timestamp,
                     model: model,
                     choices: [{
                         index: 0,
@@ -443,7 +467,8 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
                             'Authorization': `Bearer ${key}`,
                             'User-Agent': userAgent
                         },
-                        responseType: 'stream'
+                        responseType: 'stream',
+                        timeout: 60000
                     }
                 );
                 
@@ -456,10 +481,34 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
                     
                     for (const line of lines) {
                         if (line.trim()) {
-                            // 处理音频模型的媒体链接
-                            if (modelInfo.audio === true && line.includes('src=')) {
-                                const processedLine = processMediaLinks(line);
-                                res.write(processedLine + '\n');
+                            // 处理 SSE 格式
+                            if (line.startsWith('data: ')) {
+                                const data = line.substring(6);
+                                
+                                // 处理 [DONE] 标记
+                                if (data === '[DONE]') {
+                                    res.write('data: [DONE]\n\n');
+                                    continue;
+                                }
+                                
+                                try {
+                                    const json = JSON.parse(data);
+                                    
+                                    // 处理音频模型的媒体链接
+                                    if (modelInfo.audio === true && json.choices) {
+                                        json.choices = json.choices.map(choice => {
+                                            if (choice.delta && choice.delta.content) {
+                                                choice.delta.content = processMediaLinks(choice.delta.content);
+                                            }
+                                            return choice;
+                                        });
+                                    }
+                                    
+                                    res.write(`data: ${JSON.stringify(json)}\n\n`);
+                                } catch (e) {
+                                    // 如果解析失败，原样输出
+                                    res.write(line + '\n');
+                                }
                             } else {
                                 res.write(line + '\n');
                             }
@@ -469,8 +518,26 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
                 
                 response.data.on('end', () => {
                     if (buffer.trim()) {
-                        if (modelInfo.audio === true && buffer.includes('src=')) {
-                            res.write(processMediaLinks(buffer) + '\n');
+                        if (buffer.startsWith('data: ')) {
+                            const data = buffer.substring(6);
+                            if (data === '[DONE]') {
+                                res.write('data: [DONE]\n\n');
+                            } else {
+                                try {
+                                    const json = JSON.parse(data);
+                                    if (modelInfo.audio === true && json.choices) {
+                                        json.choices = json.choices.map(choice => {
+                                            if (choice.delta && choice.delta.content) {
+                                                choice.delta.content = processMediaLinks(choice.delta.content);
+                                            }
+                                            return choice;
+                                        });
+                                    }
+                                    res.write(`data: ${JSON.stringify(json)}\n\n`);
+                                } catch (e) {
+                                    res.write(buffer + '\n');
+                                }
+                            }
                         } else {
                             res.write(buffer + '\n');
                         }
@@ -492,7 +559,8 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
                             'Content-Type': 'application/json',
                             'Authorization': `Bearer ${key}`,
                             'User-Agent': userAgent
-                        }
+                        },
+                        timeout: 60000
                     }
                 );
                 
@@ -513,7 +581,11 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
         }
     } catch (error) {
         console.error('Error in chat completions:', error.message);
-        res.status(500).json({ error: 'Failed to process request' });
+        if (error.response) {
+            console.error('Response status:', error.response.status);
+            console.error('Response data:', error.response.data);
+        }
+        res.status(500).json({ error: 'Failed to process request', details: error.message });
     }
 });
 
@@ -521,6 +593,10 @@ app.post('/v1/chat/completions', authenticate, async (req, res) => {
 app.post('/v1/images/generations', authenticate, async (req, res) => {
     try {
         const { model, prompt } = req.body;
+        
+        if (!model || !prompt) {
+            return res.status(400).json({ error: 'Model and prompt are required' });
+        }
         
         // 获取Azure key
         const { key, userAgent } = await keyManager.getRandomKey();
@@ -537,7 +613,8 @@ app.post('/v1/images/generations', authenticate, async (req, res) => {
                     'Content-Type': 'application/json',
                     'Authorization': `Bearer ${key}`,
                     'User-Agent': userAgent
-                }
+                },
+                timeout: 60000
             }
         );
         
@@ -553,26 +630,71 @@ app.post('/v1/images/generations', authenticate, async (req, res) => {
         res.json(responseData);
     } catch (error) {
         console.error('Error in image generation:', error.message);
-        res.status(500).json({ error: 'Failed to generate image' });
+        if (error.response) {
+            console.error('Response status:', error.response.status);
+            console.error('Response data:', error.response.data);
+        }
+        res.status(500).json({ error: 'Failed to generate image', details: error.message });
     }
 });
 
 // 健康检查
 app.get('/health', (req, res) => {
-    res.json({ status: 'healthy' });
+    res.json({ 
+        status: 'healthy',
+        timestamp: Date.now(),
+        uptime: process.uptime()
+    });
+});
+
+// 错误处理中间件
+app.use((err, req, res, next) => {
+    console.error('Unhandled error:', err);
+    res.status(500).json({ 
+        error: 'Internal server error',
+        message: err.message 
+    });
 });
 
 // 启动服务器
 async function start() {
-    await initDatabase();
-    
-    app.listen(PORT, () => {
-        console.log(`Server running on port ${PORT}`);
-        console.log(`Base URL: ${BASE_URL}`);
-        console.log(`Auth tokens: ${AUTH_TOKENS.length} configured`);
-        console.log(`Max keys: ${MAX_KEYS}`);
-        console.log(`Key expiry: ${KEY_EXPIRY_MINUTES} minutes`);
-    });
+    try {
+        await initDatabase();
+        
+        // 预先生成一些keys
+        console.log('Pre-generating Azure keys...');
+        await keyManager.ensureKeys();
+        
+        app.listen(PORT, '0.0.0.0', () => {
+            console.log(`Server running on port ${PORT}`);
+            console.log(`Base URL: ${BASE_URL}`);
+            console.log(`Auth tokens: ${AUTH_TOKENS.length} configured`);
+            console.log(`Max keys: ${MAX_KEYS}`);
+            console.log(`Key expiry: ${KEY_EXPIRY_MINUTES} minutes`);
+            console.log(`Model cache: ${MODEL_CACHE_DAYS} days`);
+            console.log(`Storage: ${USE_SQLITE ? 'SQLite' : 'Memory'}`);
+        });
+    } catch (error) {
+        console.error('Failed to start server:', error);
+        process.exit(1);
+    }
 }
 
-start().catch(console.error);
+// 优雅关闭
+process.on('SIGTERM', async () => {
+    console.log('SIGTERM received, shutting down gracefully...');
+    if (db) {
+        await db.close();
+    }
+    process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+    console.log('SIGINT received, shutting down gracefully...');
+    if (db) {
+        await db.close();
+    }
+    process.exit(0);
+});
+
+start();
