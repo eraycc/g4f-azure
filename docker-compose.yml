@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  azure-api-proxy:
+    build: .
+    container_name: azure-api-proxy
+    ports:
+      - "3000:3000"
+    environment:
+      - BASE_URL=https://g4f.dev
+      - AUTH_TOKENS=sk-your-token-1,sk-your-token-2
+      - PROXY_URL=https://proxy.mengze.vip/proxy/
+      - PROXY_ENCODE=false
+      - MAX_KEYS=3
+      - KEY_EXPIRY_MINUTES=60
+      - MODEL_CACHE_DAYS=7
+      - USE_SQLITE=true
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
